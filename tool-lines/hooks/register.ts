@@ -1,4 +1,13 @@
-import type { BoxProps, ButtonProps, ElementConstructor, Register, RenderElement, RenderNode, TextProps } from 'claude-code'
+import type {
+  BoxProps,
+  ButtonProps,
+  ElementConstructor,
+  EngineInterface,
+  Register,
+  RenderElement,
+  RenderNode,
+  TextProps,
+} from 'claude-code'
 
 // MARK: Layout
 
@@ -283,12 +292,14 @@ type ButtonOf = (props: ButtonProps) => RenderElement
 // Only a Button takes a click, so the row's two clickable pieces, the triangle and "tool_call:", are Buttons running one toggle.
 // Each reads the set when pressed, not when drawn, so a press on a stale drawing still flips the row.
 function pressableOf(id: string, Button: ButtonOf, onToggle: () => void) {
-  return (key: string, label: string, dimColor = false): RenderElement =>
+  return (key: string, label: string, dimColor = false, children?: RenderNode[]): RenderElement =>
     Button({
       key,
       label,
       plain: true,
       dimColor,
+      // A styled line keeps its colors as children; the label stays its plain text, the control's name.
+      ...(children === undefined ? {} : { children }),
       // The row's keyed Box scopes this, so hovering the row underlines both pieces.
       hover: { underline: true },
       onPress: () => {
@@ -317,6 +328,23 @@ function hideOf(id: string, Button: ButtonOf, onHide: () => void): RenderElement
 type Draw = { Box: ElementConstructor<BoxProps>; Text: ElementConstructor<TextProps> }
 
 // One compact row, a call's or a group's: the toggle, the status dot, the "tool_call:" press target, then the line.
+// The plain text of drawn nodes: strings, and the children of the elements around them.
+function textOf(nodes: readonly unknown[]): string {
+  return nodes
+    .map(node => {
+      if (typeof node === 'string') return node
+      if (typeof node !== 'object' || node === null) return ''
+      const { children, props } = node as { children?: unknown[]; props?: { children?: unknown[] } }
+      return textOf(children ?? props?.children ?? [])
+    })
+    .join('')
+}
+
+// The rest of a row is one press target too: a click opens or shuts it, a drag still selects its text.
+function pressableLine(pressable: ReturnType<typeof pressableOf>, line: RenderNode[]): RenderNode[] {
+  return [pressable('line', textOf(line), false, line)]
+}
+
 function compactRow(draw: Draw, toggle: RenderElement, dot: { color: string }, prefix: RenderElement, line: RenderNode[]) {
   const { Box, Text } = draw
   return Box({
@@ -327,18 +355,295 @@ function compactRow(draw: Draw, toggle: RenderElement, dot: { color: string }, p
       // The dot's own column keeps wrapped rows aligned under the text, as the engine's tool rows do.
       Box({ minWidth: 2, flexShrink: 0, children: [Text({ ...dot, children: ['●'] })] }),
       Box({ flexShrink: 0, children: [prefix] }),
-      Box({ flexShrink: 1, children: [Text({ wrap: 'wrap', children: line })] }),
+      // The line is a Button of its own now, so it sits in the row as it is, not inside a Text.
+      Box({ flexShrink: 1, children: line }),
     ],
   })
+}
+
+// MARK: Message fold
+
+// Each tool call belongs to the reply text the model wrote just before it; the text's row folds its calls
+// under one dim summary line, and a click on that line lays them out again, each of which unfolds in turn.
+
+type OwnedCall = { tool_use_id: string; tool: string; row: ToolRow }
+
+// A reply's text as a key: its blocks as stored and as drawn differ only in spacing.
+function textKey(text: string): string {
+  return text.replace(/\s+/g, ' ').trim()
+}
+
+// Reply texts in transcript order, each with the calls the model made after it and before its next text.
+let owners: { key: string; calls: OwnedCall[] }[] = []
+// The owner key of every call that has one; a call made before any reply text has none and draws as before.
+const ownerOfCall = new Map<string, string>()
+// Message rows matched to an owner, by the row's requestId.
+const ownerOfRow = new Map<string, string>()
+// Owners whose text row drew the summary line, so hiding their calls never strands them out of reach.
+const drawnOwners = new Set<string>()
+// Owners the person opened.
+const openOwners = new Set<string>()
+// Replies the person opened with their bullet: only these show the summary line, and only an open summary shows the calls.
+const openMessages = new Set<string>()
+
+type Messages = readonly {
+  role: 'user' | 'assistant'
+  text: string
+  toolUses: readonly { tool_use_id: string; tool: string; input: unknown; result?: unknown; isError?: true }[]
+  toolResults?: readonly unknown[]
+}[]
+
+// Walks the transcript once: a reply text opens an owner, a call joins the latest, a typed prompt closes it.
+function indexOf(messages: Messages): void {
+  const next: { key: string; calls: OwnedCall[] }[] = []
+  let current: { key: string; calls: OwnedCall[] } | undefined
+  ownerOfCall.clear()
+  for (const message of messages) {
+    if (message.role === 'user') {
+      if ((message.toolResults ?? []).length === 0 && message.text.trim() !== '') current = undefined
+      continue
+    }
+    const key = textKey(message.text)
+    if (key !== '') {
+      current = { key, calls: [] }
+      next.push(current)
+    }
+    for (const use of message.toolUses) {
+      if (current === undefined) continue
+      const finished = use.result !== undefined || use.isError === true
+      current.calls.push({
+        tool_use_id: use.tool_use_id,
+        tool: use.tool,
+        row: {
+          tool: use.tool,
+          input: use.input,
+          output: use.result,
+          isRunning: !finished,
+          isErrored: use.isError === true,
+          isInterrupted: false,
+        },
+      })
+      ownerOfCall.set(use.tool_use_id, current.key)
+    }
+  }
+  owners = next
+}
+
+// A drawn block is one text block of a reply; the stored message joins its blocks, so the latest owner holding it wins.
+function ownerForText(text: string): string | undefined {
+  const key = textKey(text)
+  if (key === '') return undefined
+  for (let i = owners.length - 1; i >= 0; i--) {
+    const owner = owners[i]
+    if (owner !== undefined && (owner.key === key || owner.key.endsWith(key))) return owner.key
+  }
+  return undefined
+}
+
+function callsOf(key: string): OwnedCall[] {
+  return owners.findLast(owner => owner.key === key)?.calls ?? []
+}
+
+// A call is hidden while the reply it belongs to is drawn folded.
+function isFolded(toolUseId: string): boolean {
+  const owner = ownerOfCall.get(toolUseId)
+  return owner !== undefined && drawnOwners.has(owner) && !(openMessages.has(owner) && openOwners.has(owner))
+}
+
+// Prose with no block markdown: no list, table, fence, heading, quote or link, which only the engine's Markdown draws.
+function isPlainProse(text: string): boolean {
+  return !/^\s*(?:[-*+]\s|\d+[.)]\s|#|>|\||```)/m.test(text) && !/\[[^\]]*\]\([^)]*\)/.test(text)
+}
+
+// Inline `code` and **bold**, drawn as the engine draws them in a reply; the rest is plain text.
+function inlineOf(text: string, Text: ElementConstructor<TextProps>): RenderNode[] {
+  return text
+    .split(/(`[^`\n]+`|\*\*[^*\n]+\*\*)/)
+    .filter(part => part !== '')
+    .map(part => {
+      if (part.startsWith('`') && part.endsWith('`') && part.length > 2) return Text({ color: 'permission', children: [part.slice(1, -1)] })
+      if (part.startsWith('**') && part.endsWith('**') && part.length > 4) return Text({ bold: true, children: [part.slice(2, -2)] })
+      return part
+    })
+}
+
+// An opened reply's calls sit under its summary line's count, one level into the tree.
+const CHILD_INDENT = 4
+
+// The width a call's line may take: the screen's, less the indent of an opened reply's children.
+// Calls drawn inside a group of several: the group's row carries the reply's indent, so they add none of their own.
+const groupedCalls = new Set<string>()
+
+// The indent a call's own row adds: the reply's, unless its group already gave it.
+function indentOf(toolUseId: string): number {
+  return isUnderOpenOwner(toolUseId) && !groupedCalls.has(toolUseId) ? CHILD_INDENT : 0
+}
+
+// The width a line may take, less every indent it sits under: the reply's, and a group's on top for a grouped call.
+function columnsFor(columns: number | undefined, toolUseId: string, isGroupRow = false): number {
+  const reply = isUnderOpenOwner(toolUseId) ? CHILD_INDENT : 0
+  const group = !isGroupRow && groupedCalls.has(toolUseId) ? 2 : 0
+  return (columns ?? FALLBACK_COLUMNS) - reply - group
+}
+
+function isUnderOpenOwner(toolUseId: string): boolean {
+  const owner = ownerOfCall.get(toolUseId)
+  return owner !== undefined && drawnOwners.has(owner) && openMessages.has(owner) && openOwners.has(owner)
+}
+
+// The folded reply's one line: how many calls, which tools, what they changed, and what is still running or failed.
+function foldSummary(calls: readonly OwnedCall[], isOpen: boolean): { label: string; stat: StatPart[]; meta: string; metaColor?: string } {
+  const counts = new Map<string, number>()
+  for (const call of calls) counts.set(displayName(call.tool), (counts.get(displayName(call.tool)) ?? 0) + 1)
+  const names = [...counts].map(([name, count]) => (count > 1 ? `${name} ×${count}` : name))
+  const shownNames = names.length > 5 ? [...names.slice(0, 5), `+${names.length - 5}`] : names
+  const changes = calls.map(call => diffstatOf(call.row)).filter((change): change is Diffstat => change !== undefined)
+  const stat = statParts(
+    changes.length === 0
+      ? undefined
+      : changes.reduce((sum, change) => ({ added: sum.added + change.added, removed: sum.removed + change.removed })),
+  )
+  const failed = calls.filter(call => call.row.isErrored).length
+  const running = calls.filter(call => call.row.isRunning).length
+  const meta = [running > 0 ? `${running} running` : undefined, failed > 0 ? `${failed} ${failed === 1 ? 'error' : 'errors'}` : undefined]
+    .filter(part => part !== undefined)
+    .join(', ')
+  const count = `${calls.length} tool ${calls.length === 1 ? 'call' : 'calls'}`
+  return {
+    label: `${isOpen ? '▾' : '▸'} ${count} · ${shownNames.join(', ')}`,
+    stat,
+    meta,
+    ...(failed > 0 ? { metaColor: 'error' } : running > 0 ? { metaColor: 'warning' } : {}),
+  }
+}
+
+// The index is rebuilt from the transcript after each new reply or result row; a rebuild asked for mid-flight runs once more after.
+let indexing: Promise<void> | undefined
+let again = false
+// A text row drawn before its message reached the index asks again, at most once a second.
+let lastMiss = 0
+
+async function reindex($: EngineInterface): Promise<void> {
+  if (indexing !== undefined) {
+    again = true
+    return indexing
+  }
+  indexing = (async () => {
+    do {
+      again = false
+      indexOf((await $.session.messages()) as unknown as Messages)
+    } while (again)
+    indexing = undefined
+    $.ui.invalidate('ui.render')
+  })().catch(() => {
+    indexing = undefined
+  })
+  return indexing
 }
 
 // MARK: Hooks
 
 export const register: Register = on => {
+  on('session.append', async ($, e, next) => {
+    const result = await next(e)
+    if (e.agentId === undefined && (e.door === 'response' || e.door === 'tool-result')) void reindex($)
+    return result
+  })
+
+  on('ui.render', { component: 'AssistantMessage' }, async ($, e, next) => {
+    if (!isCompact(e.surface)) return next(e)
+    let key = ownerOfRow.get(e.requestId) ?? ownerForText(e.props.text)
+    if (key === undefined) {
+      const now = Date.now()
+      if (now - lastMiss > 1000) {
+        lastMiss = now
+        void reindex($)
+      }
+      return next(e)
+    }
+    ownerOfRow.set(e.requestId, key)
+    const calls = callsOf(key)
+    if (calls.length === 0) return next(e)
+    if (!drawnOwners.has(key)) {
+      drawnOwners.add(key)
+      // Its calls drew before the summary existed; they fold now.
+      $.ui.invalidate('ui.render')
+    }
+    const { Box, Button, Text, Markdown } = $.ui.resolve(e)
+    const ownerKey = key
+    // The reply's own bullet becomes its toggle: shut, the text alone; open, the summary line under it.
+    const isMessageOpen = openMessages.has(key)
+    const bullet = Box({
+      minWidth: 2,
+      flexShrink: 0,
+      children: [
+        Button({
+          key: 'message-toggle',
+          label: isMessageOpen ? '▾' : '▸',
+          plain: true,
+          hover: { underline: true },
+          onPress: () => {
+            if (openMessages.has(ownerKey)) openMessages.delete(ownerKey)
+            else openMessages.add(ownerKey)
+            $.ui.invalidate('ui.render')
+          },
+        }),
+      ],
+    })
+    // A reply in plain prose is one press target, as its bullet is; a drag over it still selects. Block
+    // markdown (lists, tables, fences, headings) needs the engine's Markdown, which a Button cannot hold.
+    const body = isPlainProse(e.props.text)
+      ? Button({
+          key: 'message-text',
+          label: e.props.text,
+          plain: true,
+          hover: { underline: true },
+          children: inlineOf(e.props.text, Text),
+          onPress: () => {
+            if (openMessages.has(ownerKey)) openMessages.delete(ownerKey)
+            else openMessages.add(ownerKey)
+            $.ui.invalidate('ui.render')
+          },
+        })
+      : Markdown({ text: e.props.text })
+    const message = Box({
+      key: 'message',
+      flexDirection: 'row',
+      children: [bullet, Box({ flexGrow: 1, flexShrink: 1, children: [body] })],
+    })
+    // The engine's reply row opens with a blank line; this one keeps that rhythm.
+    if (!isMessageOpen) return Box({ flexDirection: 'column', marginTop: 1, children: [message] })
+    const isOpen = openOwners.has(key)
+    const summary = foldSummary(calls, isOpen)
+    // The whole summary line, its counts and meta included, is the one press target.
+    const parts: RenderNode[] = [
+      Text({ dimColor: true, children: [summary.label] }),
+      ...summary.stat.map(part => Text({ color: part.color, children: [part.text] })),
+      ...(summary.meta === '' ? [] : [Text({ color: summary.metaColor, dimColor: summary.metaColor === undefined, children: [` - ${summary.meta}`] })]),
+    ]
+    const toggle = Button({
+      key: 'fold',
+      label: textOf(parts),
+      plain: true,
+      hover: { underline: true },
+      children: parts,
+      onPress: () => {
+        if (openOwners.has(ownerKey)) openOwners.delete(ownerKey)
+        else openOwners.add(ownerKey)
+        $.ui.invalidate('ui.render')
+      },
+    })
+    const line = Box({ key: 'fold-line', flexDirection: 'row', marginLeft: 2, children: [toggle] })
+    return Box({ flexDirection: 'column', marginTop: 1, children: [message, line] })
+  })
+
   // Paths draw against the session's folder; a reload fires session.start again, so it is learned anew.
   on('session.start', async ($, e, next) => {
     sessionCwd = e.cwd
-    return next(e)
+    const result = await next(e)
+    // A resumed session's transcript is already there; index it so its replies draw folded.
+    void reindex($)
+    return result
   })
 
   on('ui.render', { component: 'UserMessage', props: { origin: { kind: 'composer' } } }, async ($, e, next) => {
@@ -355,25 +660,34 @@ export const register: Register = on => {
   on('ui.render', { component: 'ToolUse' }, async ($, e, next) => {
     if (!isCompact(e.surface)) return next(e)
     const { Box, Button, Text } = $.ui.resolve(e)
+    if (isFolded(e.props.tool_use_id)) return Box({})
+    const draw = async () => {
     const pressable = pressableOf(e.props.tool_use_id, Button, () => $.ui.invalidate('ui.render'))
     const isOpen = unfolded.has(e.props.tool_use_id)
     const toggle = Box({ minWidth: 2, flexShrink: 0, children: [pressable('toggle', isOpen ? '▾' : '▸', true)] })
-    if (isOpen) {
-      // The engine's row opens with a blank line, so the triangle steps down one to sit beside its ⏺.
-      const openToggle = Box({ minWidth: 2, flexShrink: 0, marginTop: 1, children: [pressable('toggle', '▾', true)] })
-      const row = Box({ key: 'row', flexDirection: 'row', children: [openToggle, Box({ flexGrow: 1, flexShrink: 1, children: [await next(e)] })] })
-      if (hasResultBlock.has(e.props.tool_use_id)) return row
-      const hide = hideOf(e.props.tool_use_id, Button, () => $.ui.invalidate('ui.render'))
-      return Box({ flexDirection: 'column', children: [row, Box({ marginLeft: 4, children: [hide] })] })
-    }
-    const line = lineFor(e.props, e.viewport?.columns ?? FALLBACK_COLUMNS)
+    const line = lineFor(e.props, columnsFor(e.viewport?.columns, e.props.tool_use_id))
     const metaStyle = e.props.isErrored ? { color: 'error' } : { dimColor: true }
-    return compactRow({ Box, Text }, toggle, dotStyle(e.props), pressable('prefix', 'tool_call: ', true), [
+    // Open or shut, the call keeps its own line on top, so a click on it shuts what a click on it opened.
+    const compact = compactRow({ Box, Text }, toggle, dotStyle(e.props), pressable('prefix', 'tool_call: ', true), pressableLine(pressable, [
       Text({ bold: true, children: [line.tool] }),
       `(${line.subject})`,
       ...line.stat.map(part => Text({ color: part.color, children: [part.text] })),
       ...(line.meta === '' ? [] : [Text({ ...metaStyle, children: [` - ${line.meta}`] })]),
-    ])
+    ]))
+    if (!isOpen) return compact
+    // A standalone call's output is its own result block, drawn right under this line.
+    if (hasResultBlock.has(e.props.tool_use_id)) return compact
+    // A grouped call's output draws inside the engine's row, which follows the line, then the hide button.
+    const hide = hideOf(e.props.tool_use_id, Button, () => $.ui.invalidate('ui.render'))
+    return Box({
+      flexDirection: 'column',
+      children: [compact, Box({ marginLeft: 2, children: [await next(e)] }), Box({ marginLeft: 4, children: [hide] })],
+    })
+    }
+    const drawn = await draw()
+    // Under an opened reply, its calls step in one level, as children of the summary line.
+    const indent = indentOf(e.props.tool_use_id)
+    return indent > 0 ? Box({ marginLeft: indent, children: [drawn] }) : drawn
   })
 
   // A group of reads and searches folds to one line; a click unfolds it into one line per call, each of which unfolds in turn.
@@ -382,23 +696,30 @@ export const register: Register = on => {
     if (!isCompact(e.surface) || e.props.calls.length === 0) return next(e)
     // A group of one is no group: unfolded, its call draws as a line of its own, meta and all, like any other call.
     if (e.props.calls.length === 1) return next({ ...e, props: { ...e.props, isExpanded: true } })
+    for (const call of e.props.calls) if (call.tool_use_id !== undefined) groupedCalls.add(call.tool_use_id)
     const { Box, Button, Text } = $.ui.resolve(e)
+    const firstId = e.props.calls[0]?.tool_use_id ?? ''
+    if (isFolded(firstId)) return Box({})
+    const drawn = await drawGroup()
+    return isUnderOpenOwner(firstId) ? Box({ marginLeft: CHILD_INDENT, children: [drawn] }) : drawn
+    async function drawGroup() {
     // The first call stays first as later calls join, so its id names the group for as long as it is drawn.
     const id = `group:${e.props.calls[0]?.tool_use_id ?? e.requestId}`
     const pressable = pressableOf(id, Button, () => $.ui.invalidate('ui.render'))
     const isOpen = unfolded.has(id)
     const toggle = Box({ minWidth: 2, flexShrink: 0, children: [pressable('toggle', isOpen ? '▾' : '▸', true)] })
-    const line = groupLineFor(e.props.calls, e.viewport?.columns ?? FALLBACK_COLUMNS)
-    const row = compactRow({ Box, Text }, toggle, groupDotStyle(e.props.calls), pressable('prefix', 'tool_call: ', true), [
+    const line = groupLineFor(e.props.calls, columnsFor(e.viewport?.columns, firstId, true))
+    const row = compactRow({ Box, Text }, toggle, groupDotStyle(e.props.calls), pressable('prefix', 'tool_call: ', true), pressableLine(pressable, [
       Text({ bold: true, children: [line.names] }),
       ` (${line.subjects})`,
       ...line.stat.map(part => Text({ color: part.color, children: [part.text] })),
       ...(line.meta === '' ? [] : [Text({ color: 'error', children: [` - ${line.meta}`] })]),
-    ])
+    ]))
     if (!isOpen) return row
     // Unfolded, the engine draws each call as its own ToolUse row, which the ToolUse hook draws as one line.
     const calls = await next({ ...e, props: { ...e.props, isExpanded: true } })
     return Box({ flexDirection: 'column', children: [row, Box({ marginLeft: 2, children: [calls] })] })
+    }
   })
 
   // The compact line already carries what the result block would say, unless the call was clicked open.
@@ -407,8 +728,10 @@ export const register: Register = on => {
     // Recorded while still folded, so the row knows to leave the hide button to this block once unfolded.
     hasResultBlock.add(e.props.tool_use_id)
     const { Box, Button } = $.ui.resolve(e)
-    if (!unfolded.has(e.props.tool_use_id)) return Box({})
+    if (!unfolded.has(e.props.tool_use_id) || isFolded(e.props.tool_use_id)) return Box({})
     const hide = hideOf(e.props.tool_use_id, Button, () => $.ui.invalidate('ui.render'))
-    return Box({ flexDirection: 'column', children: [await next(e), Box({ marginLeft: 4, children: [hide] })] })
+    const block = Box({ flexDirection: 'column', children: [await next(e), Box({ marginLeft: 4, children: [hide] })] })
+    const indent = indentOf(e.props.tool_use_id)
+    return indent > 0 ? Box({ marginLeft: indent, children: [block] }) : block
   })
 }

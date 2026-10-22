@@ -442,7 +442,8 @@ test('hides the result block', async $ => {
 
 // MARK: Unfolding one call
 
-test('a click unfolds one call into the engine row and its result, and a second folds it', async ($, on) => {
+// Unfolded, a standalone call keeps its own pressable line on top, so a second click on that line folds it; its output is its result block.
+test('a click unfolds one call into its line and its result, and a second folds it', async ($, on) => {
   // Stands for what the engine draws at any site the mod passes on.
   on('ui.render', () => ({ type: 'Text', props: {}, children: ['engine'] }))
   const row = { ...BASH_ROW, tool_use_id: 'toolu_unfold' }
@@ -456,7 +457,7 @@ test('a click unfolds one call into the engine row and its result, and a second 
   expect((await use.find({ key: 'toggle' }))?.props.label).toBe('▸')
   await use.press({ key: 'toggle' })
 
-  expect(shown(await (await mountOn('ToolUse', row)).drawn())).toBe('▾engine')
+  expect(shown(await (await mountOn('ToolUse', row)).drawn())).toMatch(/^▾●tool_call: Bash\(.*\) - shell cwd was reset$/)
   expect(shown(await (await mountOn('ToolResult', result)).drawn())).toBe('enginehide')
   const open = await mountOn('ToolUse', row)
   expect((await open.find({ key: 'toggle' }))?.props.label).toBe('▾')
@@ -477,11 +478,13 @@ test('unfolding one call leaves the others compact', async ($, on) => {
       viewport: { columns: 200, rows: 50 },
     })
   await (await mountRow('toolu_a')).press({ key: 'toggle' })
-  expect(shown(await (await mountRow('toolu_a')).drawn())).toBe('▾enginehide')
+  expect(shown(await (await mountRow('toolu_a')).drawn())).toMatch(/^▾●tool_call: Bash\(.*\) - shell cwd was resetenginehide$/)
   expect(shown(await (await mountRow('toolu_b')).drawn())).toMatch(/^▸●tool_call: Bash/)
 })
 
-test('the triangle and "tool_call:" unfold the call; the call and its meta are plain text', async ($, on) => {
+// The whole row is pressable: the triangle, "tool_call:" and the rest of the line, whose parts keep their own styles.
+// A drag over a Button still selects its text (measured in the terminal, 2026-10-22), so copying is not lost.
+test('the triangle, "tool_call:" and the rest of the line unfold the call; the line keeps its styles', async ($, on) => {
   on('ui.render', () => ({ type: 'Text', props: {}, children: ['engine'] }))
   const mountRow = (id: string) =>
     $.ui.mount({
@@ -495,11 +498,17 @@ test('the triangle and "tool_call:" unfold the call; the call and its meta are p
   expect(await folded.find({ key: 'call' })).toBeUndefined()
   expect(await folded.find({ key: 'meta' })).toBeUndefined()
   expect((await folded.find({ type: 'Text', text: /^Bash$/ }))?.props.bold).toBe(true)
-  for (const key of ['toggle', 'prefix']) {
+  expect((await folded.find({ key: 'line' }))?.props.label).toBe(
+    'Bash(cd /Users/arya/repo && grep -rn "needle" packages) - shell cwd was reset',
+  )
+  for (const key of ['toggle', 'prefix', 'line']) {
     const id = `toolu_${key}`
     await (await mountRow(id)).press({ key })
-    expect(shown(await (await mountRow(id)).drawn())).toBe('▾enginehide')
+    expect(shown(await (await mountRow(id)).drawn())).toMatch(/^▾●tool_call: Bash\(.*\) - shell cwd was resetenginehide$/)
   }
+  // The line stays on top once unfolded, and a press on it folds the call again.
+  await (await mountRow('toolu_line')).press({ key: 'line' })
+  expect(shown(await (await mountRow('toolu_line')).drawn())).toMatch(/^▸●tool_call: Bash/)
 })
 
 test('keeps an error red', async $ => {
@@ -543,7 +552,7 @@ test('a grouped call, whose output draws inline, gets hide at the end of its row
     })
   await (await mountRow()).press({ key: 'prefix' })
   const open = await mountRow()
-  expect(shown(await open.drawn())).toBe('▾enginehide')
+  expect(shown(await open.drawn())).toBe('▾●tool_call: Read(/a.md)enginehide')
   await open.press({ key: 'hide' })
   expect(shown(await (await mountRow()).drawn())).toMatch(/^▸●tool_call: Read/)
 })

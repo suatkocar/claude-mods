@@ -10,8 +10,16 @@ expanded `tool-lines` controls and summaries for personal use.
 
 ## Tool-lines improvements
 
-- Click the triangle or `tool_call:` to unfold one call; close it with the
-  triangle or the `hide` button below its output.
+- Fold each reply's tool calls under the reply itself: its bullet becomes `▸`,
+  and the transcript shows only the replies. Opening a reply shows one summary
+  line (`▸ 3 tool calls · Write ×2, Bash +2`); opening that shows the calls,
+  one level in, and each call opens to its full output.
+- Click anywhere on a row to open or close it: a reply in plain prose, the
+  summary line, a call's line. Dragging still selects and copies the text.
+  Replies with tables, lists or code blocks keep the engine's Markdown and open
+  from their `▸`.
+- Close an unfolded call from its line, its triangle or the `hide` button below
+  its output.
 - Show longer commands, session-relative paths and shortened scratchpad paths.
 - Include added/removed line counts, Read line counts, agent statistics and
   readable MCP tool names in compact rows.
