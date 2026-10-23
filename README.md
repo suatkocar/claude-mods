@@ -14,6 +14,8 @@ expanded `tool-lines` controls and summaries for personal use.
   and the transcript shows only the replies. Opening a reply shows one summary
   line (`▸ 3 tool calls · Write ×2, Bash +2`); opening that shows the calls,
   one level in, and each call opens to its full output.
+  `AskUserQuestion` never folds: the question and your answer stay as Claude
+  Code draws them.
 - Click anywhere on a row to open or close it: a reply in plain prose, the
   summary line, a call's line. Dragging still selects and copies the text.
   Replies with tables, lists or code blocks keep the engine's Markdown and open

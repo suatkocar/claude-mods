@@ -393,23 +393,39 @@ type Messages = readonly {
   toolResults?: readonly unknown[]
 }[]
 
+// Calls that are a talk with the person, not work: the question and its answer stay as the engine draws them, never folded.
+const SHOWN_AS_IS = new Set(['AskUserQuestion'])
+
+// Calls drawn right under a typed prompt, with no reply text between: they keep the blank line the engine's rows open with.
+const firstAfterPrompt = new Set<string>()
+
 // Walks the transcript once: a reply text opens an owner, a call joins the latest, a typed prompt closes it.
 function indexOf(messages: Messages): void {
   const next: { key: string; calls: OwnedCall[] }[] = []
   let current: { key: string; calls: OwnedCall[] } | undefined
+  let isAfterPrompt = false
   ownerOfCall.clear()
+  firstAfterPrompt.clear()
   for (const message of messages) {
     if (message.role === 'user') {
-      if ((message.toolResults ?? []).length === 0 && message.text.trim() !== '') current = undefined
+      if ((message.toolResults ?? []).length === 0 && message.text.trim() !== '') {
+        current = undefined
+        isAfterPrompt = true
+      }
       continue
     }
     const key = textKey(message.text)
     if (key !== '') {
       current = { key, calls: [] }
       next.push(current)
+      isAfterPrompt = false
     }
     for (const use of message.toolUses) {
-      if (current === undefined) continue
+      if (isAfterPrompt) {
+        firstAfterPrompt.add(use.tool_use_id)
+        isAfterPrompt = false
+      }
+      if (current === undefined || SHOWN_AS_IS.has(use.tool)) continue
       const finished = use.result !== undefined || use.isError === true
       current.calls.push({
         tool_use_id: use.tool_use_id,
@@ -652,13 +668,12 @@ export const register: Register = on => {
       // Tool rows keep their last answer until asked again, so the switch has to redraw them.
       $.ui.invalidate('ui.render')
     }
-    if (!isCompact(e.surface)) return next(e)
-    const { Box } = $.ui.resolve(e)
-    return Box({ flexDirection: 'column', marginBottom: 1, children: [await next(e)] })
+    // The prompt adds no space of its own: the reply under it, or the first call (see firstAfterPrompt), brings the blank line.
+    return next(e)
   })
 
   on('ui.render', { component: 'ToolUse' }, async ($, e, next) => {
-    if (!isCompact(e.surface)) return next(e)
+    if (!isCompact(e.surface) || SHOWN_AS_IS.has(e.props.tool)) return next(e)
     const { Box, Button, Text } = $.ui.resolve(e)
     if (isFolded(e.props.tool_use_id)) return Box({})
     const draw = async () => {
@@ -687,7 +702,9 @@ export const register: Register = on => {
     const drawn = await draw()
     // Under an opened reply, its calls step in one level, as children of the summary line.
     const indent = indentOf(e.props.tool_use_id)
-    return indent > 0 ? Box({ marginLeft: indent, children: [drawn] }) : drawn
+    const isFirst = firstAfterPrompt.has(e.props.tool_use_id)
+    if (indent === 0 && !isFirst) return drawn
+    return Box({ ...(indent > 0 ? { marginLeft: indent } : {}), ...(isFirst ? { marginTop: 1 } : {}), children: [drawn] })
   })
 
   // A group of reads and searches folds to one line; a click unfolds it into one line per call, each of which unfolds in turn.
@@ -701,7 +718,10 @@ export const register: Register = on => {
     const firstId = e.props.calls[0]?.tool_use_id ?? ''
     if (isFolded(firstId)) return Box({})
     const drawn = await drawGroup()
-    return isUnderOpenOwner(firstId) ? Box({ marginLeft: CHILD_INDENT, children: [drawn] }) : drawn
+    const isUnder = isUnderOpenOwner(firstId)
+    const isFirst = firstAfterPrompt.has(firstId)
+    if (!isUnder && !isFirst) return drawn
+    return Box({ ...(isUnder ? { marginLeft: CHILD_INDENT } : {}), ...(isFirst ? { marginTop: 1 } : {}), children: [drawn] })
     async function drawGroup() {
     // The first call stays first as later calls join, so its id names the group for as long as it is drawn.
     const id = `group:${e.props.calls[0]?.tool_use_id ?? e.requestId}`
@@ -724,7 +744,7 @@ export const register: Register = on => {
 
   // The compact line already carries what the result block would say, unless the call was clicked open.
   on('ui.render', { component: 'ToolResult' }, async ($, e, next) => {
-    if (!isCompact(e.surface)) return next(e)
+    if (!isCompact(e.surface) || SHOWN_AS_IS.has(e.props.tool)) return next(e)
     // Recorded while still folded, so the row knows to leave the hide button to this block once unfolded.
     hasResultBlock.add(e.props.tool_use_id)
     const { Box, Button } = $.ui.resolve(e)

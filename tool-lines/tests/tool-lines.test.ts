@@ -257,7 +257,8 @@ test('names an MCP tool by its server and tool', async $ => {
 
 // MARK: UserMessage
 
-test('pads below the prompt so the tool block starts apart from it', async ($, on) => {
+// The tool block still starts apart from the prompt: the first call under it opens with a blank line (message-fold.test.ts).
+test('adds no space below the prompt, so a reply under it keeps the one blank line the engine gives it', async ($, on) => {
   // Stands for what the engine draws at any site the mod passes on.
   on('ui.render', () => ({ type: 'Text', props: {}, children: ['engine'] }))
   const ui = await $.ui.mount({
@@ -268,8 +269,8 @@ test('pads below the prompt so the tool block starts apart from it', async ($, o
     viewport: { columns: 200, rows: 50 },
   } as never)
   const root = (await ui.drawn()) as { type: string; props?: { marginBottom?: number } }
-  expect(root.type).toBe('Box')
-  expect(root.props?.marginBottom).toBe(1)
+  expect(root.type).toBe('Text')
+  expect(root.props?.marginBottom).toBeUndefined()
   expect(shown(root)).toBe('engine')
 })
 
